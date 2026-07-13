@@ -47,10 +47,20 @@ app/
     builder.py
     nodes.py
     state.py
+  models/
+    order.py
+  repositories/
+    order_repository.py
   services/
     gemini.py
+    order_service.py
+  tools/
+    order.py
+    tool_collection.py
+  database.py
   main.py
 requirements.txt
+seed_db.py
 </directory_structure>
 
 <files>
@@ -66,6 +76,7 @@ router = APIRouter()
 
 class ChatRequest(BaseModel):
     message: str
+    
 
 @router.post("/chat")
 async def chat_endpoint(request: ChatRequest):
@@ -76,9 +87,10 @@ async def chat_endpoint(request: ChatRequest):
     initial_state= {
     'messages': [HumanMessage(content= user_input)]
 }
-    chat_response = agent.invoke(initial_state)
+    chat_response = await agent.ainvoke(initial_state)
         
-    response_content = chat_response['messages'][-1].text()
+    response_content = chat_response['messages'][-1].content
+    
 
     return {"response": response_content}
 </file>
@@ -87,13 +99,18 @@ async def chat_endpoint(request: ChatRequest):
 from langgraph.graph import StateGraph, START, END
 from app.graph.nodes import chatbot_node
 from app.graph.state import AgentState
+from langgraph.prebuilt import ToolNode, tools_condition
+from app.tools.tool_collection import tools
 
 graph = StateGraph(AgentState)
 
 graph.add_node('chatbot_node', chatbot_node)
+graph.add_node('tools', ToolNode(tools))
 
-graph.add_edge(START, 'chatbot_node') 
-graph.add_edge('chatbot_node', END)
+graph.add_edge(START, 'chatbot_node')
+
+graph.add_conditional_edges('chatbot_node', tools_condition)
+graph.add_edge('tools', 'chatbot_node') 
 
 agent= graph.compile()
 </file>
@@ -101,12 +118,12 @@ agent= graph.compile()
 <file path="app/graph/nodes.py">
 from app.graph.state import AgentState
 from app.services.gemini import get_llm
+from app.tools.tool_collection import tools
 
 def chatbot_node(state: AgentState)->AgentState:
     messages = state.get('messages', [])
-    
     llm = get_llm()
-    
+     
     response = llm.invoke(messages)
     
     return {'messages': [response]}
@@ -121,25 +138,133 @@ class AgentState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
 </file>
 
+<file path="app/models/order.py">
+from sqlalchemy import Column, String, Date
+from app.database import Base
+
+class Order(Base):
+    __tablename__ = "orders"
+
+    id = Column(String, primary_key=True, index=True)
+    status_code = Column(String, nullable=False)
+    delivery_date = Column(Date, nullable=False)
+</file>
+
+<file path="app/repositories/order_repository.py">
+from sqlalchemy.orm import Session
+from app.models.order import Order
+from typing import Dict, Any, Optional
+
+class OrderRepository:
+    def __init__(self, db_session: Session):
+        self.db = db_session
+
+    def get_order_by_id(self, order_id: str) -> Optional[Dict[str, Any]]:
+        # Query the database for the order
+        order_record = self.db.query(Order).filter(Order.id == order_id).first()
+        
+        if not order_record:
+            return None
+            
+        # Return it as a dictionary so the Service layer can process it
+        return {
+            "id": order_record.id,
+            "status_code": order_record.status_code,
+            "delivery_date": str(order_record.delivery_date)
+        }
+</file>
+
 <file path="app/services/gemini.py">
 import os
-
 from dotenv import load_dotenv
 from langchain_google_genai import ChatGoogleGenerativeAI
+from app.tools.tool_collection import tools
 
 load_dotenv()
 
-def get_llm():
-    api_key = os.getenv("GOOGLE_API_KEY")
-    if not api_key:
-        raise ValueError("GOOGLE_API_KEY is not set in the environment variables.")
+api_key = os.getenv("GOOGLE_API_KEY")
+
+if not api_key:
+    raise ValueError("GOOGLE_API_KEY is not set in the environment variables.")
     
-    llm = ChatGoogleGenerativeAI(
-        model="gemini-3.5-flash",
-        
-        api_key=api_key
-    )
-    return llm
+llm = ChatGoogleGenerativeAI(model="gemini-3.1-flash-lite", api_key=api_key)
+
+def get_llm():
+    return llm.bind_tools(tools)
+</file>
+
+<file path="app/services/order_service.py">
+from app.repositories.order_repository import OrderRepository
+from app.database import get_db
+
+class OrderService:
+
+    @staticmethod
+    def lookup(order_id: str):
+        db_session = next(get_db()) 
+    
+        try:
+        # Instantiate layers
+            repo = OrderRepository(db_session)
+            
+            order_data = repo.get_order_by_id(order_id)
+            
+            return order_data
+        finally:
+        # Ensure the connection is released back to the pool
+            db_session.close()
+</file>
+
+<file path="app/tools/order.py">
+from langchain_core.tools import tool
+import json
+from app.services.order_service import OrderService
+
+@tool
+def order_lookup(order_id: str) -> str:
+    """
+    Look up an order by its ID.
+    """
+    
+    order= OrderService.lookup(order_id)
+    if not order:
+        return json.dumps({"error": f"Order with ID :{order_id} not found"})
+    
+    return order
+</file>
+
+<file path="app/tools/tool_collection.py">
+from app.tools.order import order_lookup
+
+tools=[order_lookup]
+</file>
+
+<file path="app/database.py">
+import os
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker, declarative_base
+from dotenv import load_dotenv
+
+load_dotenv()
+
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+if not DATABASE_URL:
+    raise ValueError("DATABASE_URL environment variable is not set.")
+
+engine = create_engine(DATABASE_URL)
+
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+Base = declarative_base()
+
+def get_db():
+    """Dependency to get a database session and ensure it closes automatically."""
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 </file>
 
 <file path="app/main.py">
@@ -163,6 +288,65 @@ langchain
 langchain-google-genai
 langchain-core
 langgraph
+sqlalchemy
+psycopg2-binary
+</file>
+
+<file path="seed_db.py">
+from datetime import date, timedelta
+from app.database import engine, SessionLocal, Base
+from app.models.order import Order
+
+def seed_database():
+    print("Creating database tables...")
+    # This creates the tables based on your models (if they don't already exist)
+    Base.metadata.create_all(bind=engine)
+    
+    # Open a database session
+    db = SessionLocal()
+    
+    try:
+        # Check if we already have data to avoid duplicate errors on multiple runs
+        existing_order = db.query(Order).first()
+        if existing_order:
+            print("Database already contains data. Skipping seed.")
+            return
+
+        print("Inserting demo data...")
+        
+        # Create some mock orders
+        demo_orders = [
+            Order(
+                id="ORD-001", 
+                status_code="Shipped", 
+                delivery_date=date.today() + timedelta(days=2)
+            ),
+            Order(
+                id="ORD-002", 
+                status_code="Processing", 
+                delivery_date=date.today() + timedelta(days=5)
+            ),
+            Order(
+                id="ORD-003", 
+                status_code="Delivered", 
+                delivery_date=date.today() - timedelta(days=1)
+            )
+        ]
+        
+        # Add them to the session and commit them to the database
+        db.add_all(demo_orders)
+        db.commit()
+        
+        print("Successfully seeded the database with demo orders!")
+        
+    except Exception as e:
+        db.rollback()
+        print(f"An error occurred: {e}")
+    finally:
+        db.close()
+
+if __name__ == "__main__":
+    seed_database()
 </file>
 
 </files>
