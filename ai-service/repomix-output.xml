@@ -1,0 +1,159 @@
+This file is a merged representation of the entire codebase, combined into a single document by Repomix.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of the entire repository's contents.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files (if enabled)
+5. Multiple file entries, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+</file_summary>
+
+<directory_structure>
+app/
+  api/
+    chat.py
+  graph/
+    builder.py
+    nodes.py
+    state.py
+  services/
+    gemini.py
+  main.py
+requirements.txt
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path="app/api/chat.py">
+from fastapi import APIRouter, Request
+from pydantic import BaseModel
+from app.graph.builder import agent
+from langchain_core.messages import HumanMessage
+
+router = APIRouter()
+
+class ChatRequest(BaseModel):
+    message: str
+
+@router.post("/chat")
+async def chat_endpoint(request: ChatRequest):
+    
+    user_input = request.message
+    # Here you would typically call your chat model or service
+    # For demonstration, we'll just echo the user input
+    initial_state= {
+    'messages': [HumanMessage(content= user_input)]
+}
+    chat_response = agent.invoke(initial_state)
+        
+    response_content = chat_response['messages'][-1].content[0]['text']
+
+    return {"response": response_content}
+</file>
+
+<file path="app/graph/builder.py">
+from langgraph.graph import StateGraph, START, END
+from app.graph.nodes import Chatbot
+from app.graph.state import AgentState
+
+graph = StateGraph(AgentState)
+
+graph.add_node('chatbot', Chatbot)
+
+graph.add_edge(START, 'chatbot')
+graph.add_edge('chatbot', END)
+
+agent= graph.compile()
+</file>
+
+<file path="app/graph/nodes.py">
+from app.graph.state import AgentState
+from app.services.gemini import get_llm
+
+def Chatbot(state: AgentState)->AgentState:
+    messages = state['messages']
+    
+    response = get_llm.invoke(messages)
+    
+    return {'messages': [response]}
+</file>
+
+<file path="app/graph/state.py">
+from langgraph.graph import StateGraph
+from typing import TypedDict, Annotated
+from langgraph.graph.message import BaseMessage, add_messages
+
+class AgentState(TypedDict):
+    messages: Annotated[list[BaseMessage], add_messages]
+</file>
+
+<file path="app/services/gemini.py">
+import os
+
+from dotenv import load_dotenv
+from langchain_google_genai import ChatGoogleGenerativeAI
+
+load_dotenv()
+
+get_llm = ChatGoogleGenerativeAI(
+    model="gemini-3.5-flash",
+    google_api_key=os.environ.get("GOOGLE_API_KEY"),
+)
+</file>
+
+<file path="app/main.py">
+from fastapi import FastAPI
+from app.api.chat import router
+
+app = FastAPI()
+
+@app.get("/health")
+def health_check():
+    return {"status": "ok"}
+
+app.include_router(router, prefix="/api")
+</file>
+
+<file path="requirements.txt">
+fastapi
+uvicorn[standard]
+python-dotenv
+langchain
+langchain-google-genai
+langchain-core
+langgraph
+</file>
+
+</files>
