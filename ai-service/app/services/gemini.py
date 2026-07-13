@@ -5,10 +5,18 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 
 load_dotenv()
 
-get_llm = ChatGoogleGenerativeAI(
-    model="gemini-3.5-flash",
-    google_api_key=os.environ.get("GOOGLE_API_KEY"),
-)
+def get_llm():
+    api_key = os.getenv("GOOGLE_API_KEY")
+    if not api_key:
+        raise ValueError("GOOGLE_API_KEY is not set in the environment variables.")
+    
+    llm = ChatGoogleGenerativeAI(
+        model="gemini-3.5-flash",
+        
+        api_key=api_key
+    )
+    return llm
+
 
 
 

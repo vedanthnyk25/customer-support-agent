@@ -78,22 +78,22 @@ async def chat_endpoint(request: ChatRequest):
 }
     chat_response = agent.invoke(initial_state)
         
-    response_content = chat_response['messages'][-1].content[0]['text']
+    response_content = chat_response['messages'][-1].text()
 
     return {"response": response_content}
 </file>
 
 <file path="app/graph/builder.py">
 from langgraph.graph import StateGraph, START, END
-from app.graph.nodes import Chatbot
+from app.graph.nodes import chatbot_node
 from app.graph.state import AgentState
 
 graph = StateGraph(AgentState)
 
-graph.add_node('chatbot', Chatbot)
+graph.add_node('chatbot_node', chatbot_node)
 
-graph.add_edge(START, 'chatbot')
-graph.add_edge('chatbot', END)
+graph.add_edge(START, 'chatbot_node') 
+graph.add_edge('chatbot_node', END)
 
 agent= graph.compile()
 </file>
@@ -102,10 +102,12 @@ agent= graph.compile()
 from app.graph.state import AgentState
 from app.services.gemini import get_llm
 
-def Chatbot(state: AgentState)->AgentState:
-    messages = state['messages']
+def chatbot_node(state: AgentState)->AgentState:
+    messages = state.get('messages', [])
     
-    response = get_llm.invoke(messages)
+    llm = get_llm()
+    
+    response = llm.invoke(messages)
     
     return {'messages': [response]}
 </file>
@@ -127,10 +129,17 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 
 load_dotenv()
 
-get_llm = ChatGoogleGenerativeAI(
-    model="gemini-3.5-flash",
-    google_api_key=os.environ.get("GOOGLE_API_KEY"),
-)
+def get_llm():
+    api_key = os.getenv("GOOGLE_API_KEY")
+    if not api_key:
+        raise ValueError("GOOGLE_API_KEY is not set in the environment variables.")
+    
+    llm = ChatGoogleGenerativeAI(
+        model="gemini-3.5-flash",
+        
+        api_key=api_key
+    )
+    return llm
 </file>
 
 <file path="app/main.py">

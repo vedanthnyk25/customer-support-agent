@@ -7,6 +7,7 @@ router = APIRouter()
 
 class ChatRequest(BaseModel):
     message: str
+    
 
 @router.post("/chat")
 async def chat_endpoint(request: ChatRequest):
@@ -17,8 +18,9 @@ async def chat_endpoint(request: ChatRequest):
     initial_state= {
     'messages': [HumanMessage(content= user_input)]
 }
-    chat_response = agent.invoke(initial_state)
+    chat_response = await agent.ainvoke(initial_state)
         
-    response_content = chat_response['messages'][-1].content[0]['text']
+    response_content = chat_response['messages'][-1].content
+    
 
     return {"response": response_content}
