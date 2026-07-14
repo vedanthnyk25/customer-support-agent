@@ -12,7 +12,7 @@ def order_lookup(order_id: str) -> str:
     if not order:
         return json.dumps({"error": f"Order with ID :{order_id} not found"})
     
-    return order
+    return json.dumps(order)
 
 
 

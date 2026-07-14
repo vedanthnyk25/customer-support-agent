@@ -50,16 +50,25 @@ app/
   models/
     order.py
     product.py
+    ticket.py
+  prompts/
+    system_prompt.py
   repositories/
     order_repository.py
+    policy_repository.py
     product_repository.py
+    ticket_repository.py
   services/
     gemini.py
     order_service.py
+    policy_service.py
     product_service.py
+    ticket_service.py
   tools/
     order.py
+    policy.py
     product.py
+    ticket.py
     tool_collection.py
   database.py
   main.py
@@ -123,9 +132,12 @@ agent= graph.compile()
 from app.graph.state import AgentState
 from app.services.gemini import get_llm
 from app.tools.tool_collection import tools
+from app.prompts.system_prompt import system_prompt
 
 def chatbot_node(state: AgentState)->AgentState:
     messages = state.get('messages', [])
+    messages.insert(0, system_prompt)
+    
     llm = get_llm()
      
     response = llm.invoke(messages)
@@ -168,6 +180,32 @@ class Product(Base):
     stock_quantity = Column(Integer, default=0)
 </file>
 
+<file path="app/models/ticket.py">
+from sqlalchemy import Column, String, Text
+from app.database import Base
+
+class Ticket(Base):
+    __tablename__ = "tickets"
+
+    id = Column(String, primary_key=True, index=True)
+    description = Column(Text, nullable=False)
+    status = Column(String, default="Open")
+</file>
+
+<file path="app/prompts/system_prompt.py">
+from langchain_core.messages import SystemMessage
+
+system_prompt = SystemMessage(content="""
+    You are a professional customer support agent. 
+    You have access to tools to check orders, products, and company policies.
+    
+    CRITICAL RULE FOR POLICIES: When a user asks about returns, warranties, or rules, 
+    you MUST use the policy_lookup tool. You must base your answer EXCLUSIVELY on the 
+    retrieved context. If the retrieved context does not contain the answer, do not guess. 
+    Simply state that you do not have that specific information and offer to create a support ticket.
+    """)
+</file>
+
 <file path="app/repositories/order_repository.py">
 from sqlalchemy.orm import Session
 from app.models.order import Order
@@ -196,6 +234,34 @@ class OrderRepository:
             status_code=order_record.status_code,
             delivery_date=str(order_record.delivery_date)
         )
+</file>
+
+<file path="app/repositories/policy_repository.py">
+import os
+from dotenv import load_dotenv
+from app.services.gemini import get_embeddings
+
+
+load_dotenv()
+
+class PolicyRepository:
+    def __init__(self):
+        self.embeddings= get_embeddings()
+        self.index_name = os.getenv("PINECONE_INDEX_NAME")
+        
+        pc= PineCone(api_key=os.getenv("PINECONE_API_KEY"))
+        self.index = pc.Index(self.index_name)
+        
+        self.vector_store = PineconeVectorStore(
+            index=self.index,
+            embedding=self.embeddings,
+            text_key="text",
+        )
+    
+    def search_policies(self, query: str, top_k: int=5)-> list[str]: 
+        docs = self.vector_store.similarity_search(query, k=top_k)
+        
+        return [result.page_content for result in docs]
 </file>
 
 <file path="app/repositories/product_repository.py">
@@ -237,10 +303,49 @@ class ProductRepository:
         ]
 </file>
 
+<file path="app/repositories/ticket_repository.py">
+import uuid
+from sqlalchemy.orm import Session
+from app.models.ticket import Ticket
+from pydantic import BaseModel
+
+class TicketDTO(BaseModel):
+    id: str
+    description: str
+    status: str
+
+class TicketRepository:
+    def __init__(self, db_session: Session):
+        self.db = db_session
+
+    def create_ticket(self, description: str) -> TicketDTO:
+        # Generate a unique 8-character ID like "TKT-A1B2C3D4"
+        ticket_id = f"TKT-{str(uuid.uuid4())[:8].upper()}"
+        
+        # Create the database record
+        new_ticket = Ticket(
+            id=ticket_id, 
+            description=description, 
+            status="Open"
+        )
+        
+        # Write to the database
+        self.db.add(new_ticket)
+        self.db.commit()
+        self.db.refresh(new_ticket)
+        
+        # Return the safe Pydantic object
+        return TicketDTO(
+            id=new_ticket.id,
+            description=new_ticket.description,
+            status=new_ticket.status
+        )
+</file>
+
 <file path="app/services/gemini.py">
 import os
 from dotenv import load_dotenv
-from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from app.tools.tool_collection import tools
 
 load_dotenv()
@@ -251,9 +356,13 @@ if not api_key:
     raise ValueError("GOOGLE_API_KEY is not set in the environment variables.")
     
 llm = ChatGoogleGenerativeAI(model="gemini-3.1-flash-lite", api_key=api_key)
+llm = llm.bind_tools(tools)
 
 def get_llm():
-    return llm.bind_tools(tools)
+    return llm
+
+def get_embeddings():
+    return GoogleGenerativeAIEmbeddings(model="models/embedding-001", api_key=api_key)
 </file>
 
 <file path="app/services/order_service.py">
@@ -276,10 +385,34 @@ class OrderService:
             if not order_data:
                 return {"error": f"Order with ID :{order_id} not found"}
             
-            return json.dumps(order_data)
+            return order_data.model_dump()  # Convert Pydantic model to dictionary for JSON serialization
         finally:
         # Ensure the connection is released back to the pool
             db_session.close()
+</file>
+
+<file path="app/services/policy_service.py">
+from app.repositories.order_repository import PolicyRepository
+from app.database import get_db
+import json
+
+class PolicyService:
+
+    @staticmethod
+    def ask_policy(query: str):
+      try:
+        repo = PolicyRepository()
+        relevant_docs = repo.search_policies(query)
+        
+        if not relevant_docs:
+            return {"message": "No relevant policies found for the given query."}
+        
+        combined_docs = "\n\n---\n\n".join(relevant_docs)
+        
+        return {"retrieved_context": combined_docs}
+      
+      except Exception as e:
+        return {"error": f"An error occurred while retrieving policies: {str(e)}"}
 </file>
 
 <file path="app/services/product_service.py">
@@ -298,7 +431,25 @@ class ProductService:
             if not products:
                 return {"message": f"No products found matching '{search_term}'."}
                 
-            return json.dumps(products)
+            return {"results": [p.model_dump() for p in products]}
+        finally:
+            db_session.close()
+</file>
+
+<file path="app/services/ticket_service.py">
+from app.database import get_db
+from app.repositories.ticket_repository import TicketRepository
+
+class TicketService:
+    @staticmethod
+    def create(description: str):
+        db_session = next(get_db())
+        try:
+            repo = TicketRepository(db_session)
+            ticket_dto = repo.create_ticket(description)
+            
+            # Convert Pydantic object to a standard dictionary
+            return ticket_dto.model_dump()
         finally:
             db_session.close()
 </file>
@@ -321,6 +472,23 @@ def order_lookup(order_id: str) -> str:
     return order
 </file>
 
+<file path="app/tools/policy.py">
+import json
+from langchain_core.tools import tool
+from app.services.policy_service import PolicyService
+
+@tool
+def policy_lookup(question: str) -> str:
+    """
+    Search the company knowledge base for official policies, rules, or FAQs.
+    Use this when a user asks about returns, refunds, shipping rules, or warranties.
+    Pass the user's specific question as the input.
+    """
+    result = PolicyService.ask_policy(question)
+    
+    return json.dumps(result)
+</file>
+
 <file path="app/tools/product.py">
 import json
 from langchain_core.tools import tool
@@ -340,11 +508,30 @@ def product_lookup(search_term: str) -> str:
     return json.dumps(result)
 </file>
 
+<file path="app/tools/ticket.py">
+import json
+from langchain_core.tools import tool
+from app.services.ticket_service import TicketService
+
+@tool
+def create_support_ticket(description: str) -> str:
+    """
+    Create a support ticket when a user wants to file a complaint, report an issue, 
+    or escalate a problem. 
+    The input 'description' should be a detailed summary of the user's issue.
+    """
+    result = TicketService.create(description)
+    
+    return json.dumps(result)
+</file>
+
 <file path="app/tools/tool_collection.py">
 from app.tools.order import order_lookup
 from app.tools.product import product_lookup
+from app.tools.ticket import create_support_ticket
+from app.tools.policy import policy_lookup
 
-tools=[order_lookup, product_lookup]
+tools=[order_lookup, product_lookup, create_support_ticket, policy_lookup]
 </file>
 
 <file path="app/database.py">
@@ -398,13 +585,16 @@ langchain-core
 langgraph
 sqlalchemy
 psycopg2-binary
+pinecone-client
+langchain-pinecone
 </file>
 
 <file path="seed_db.py">
 from datetime import date, timedelta
 from app.database import engine, SessionLocal, Base
 from app.models.order import Order
-from app.models.product import Product  # <-- Added the Product import
+from app.models.product import Product 
+from app.models.ticket import Ticket
 
 def seed_database():
     print("Creating database tables...")
