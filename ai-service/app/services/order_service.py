@@ -1,5 +1,6 @@
 from app.repositories.order_repository import OrderRepository
 from app.database import get_db
+import json
 
 class OrderService:
 
@@ -13,7 +14,10 @@ class OrderService:
             
             order_data = repo.get_order_by_id(order_id)
             
-            return order_data
+            if not order_data:
+                return {"error": f"Order with ID :{order_id} not found"}
+            
+            return order_data.model_dump()  # Convert Pydantic model to dictionary for JSON serialization
         finally:
         # Ensure the connection is released back to the pool
             db_session.close()
