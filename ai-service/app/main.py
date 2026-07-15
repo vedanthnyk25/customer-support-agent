@@ -7,6 +7,9 @@ from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
 from app.api.chat import router
 from app.graph.builder import graph
+from fastapi.middleware.cors import CORSMiddleware
+import asyncio
+import logging
 
 load_dotenv()
 DATABASE_URL = os.getenv("DATABASE_URL")
