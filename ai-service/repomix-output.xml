@@ -74,45 +74,86 @@ app/
   main.py
 requirements.txt
 seed_db.py
+seed_policies.py
 </directory_structure>
 
 <files>
 This section contains the contents of the repository's files.
 
 <file path="app/api/chat.py">
+import json
+import uuid
 from fastapi import APIRouter, Request
-from pydantic import BaseModel
-from app.graph.builder import agent
-from langchain_core.messages import HumanMessage
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
+from langchain_core.messages import HumanMessage, AIMessageChunk
 
 router = APIRouter()
 
+
 class ChatRequest(BaseModel):
-    message: str
-    
+    message: str = Field(min_length=1, max_length=4000) 
+    thread_id: str = Field(default_factory=lambda: str(uuid.uuid4()), max_length=200)
+
+
+def _extract_text(content) -> str:
+    """Gemini can return content as a plain string OR as a list of parts
+    (e.g. [{"type": "text", "text": "..."}]) depending on the chunk.
+    Normalize both shapes to a plain string."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            part.get("text", "") for part in content if isinstance(part, dict)
+        )
+    return ""
+
 
 @router.post("/chat")
-async def chat_endpoint(request: ChatRequest):
-    
+async def chat_endpoint(request: ChatRequest, http_request: Request):
     user_input = request.message
-    # Here you would typically call your chat model or service
-    # For demonstration, we'll just echo the user input
-    initial_state= {
-    'messages': [HumanMessage(content= user_input)]
-}
-    chat_response = await agent.ainvoke(initial_state)
-        
-    response_content = chat_response['messages'][-1].content
-    
+    thread_id = request.thread_id
 
-    return {"response": response_content}
+    initial_state = {'messages': [HumanMessage(content=user_input)]}
+    config = {"configurable": {"thread_id": thread_id}}
+    
+    agent = http_request.app.state.agent
+
+    async def response_generator():
+        yield f"data: {json.dumps({'thread_id': thread_id})}\n\n"
+
+        try:
+            async for msg, metadata in agent.astream(
+                initial_state, config=config, stream_mode="messages"
+            ):
+                if not isinstance(msg, AIMessageChunk) or not msg.content:
+                    continue
+
+                text = _extract_text(msg.content)
+                if text:
+                    yield f"data: {json.dumps({'chunk': text})}\n\n"
+        except Exception as e:
+            yield f"data: {json.dumps({'error': str(e)})}\n\n"
+        finally:
+            yield "data: [DONE]\n\n"
+
+    return StreamingResponse(
+        response_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 </file>
 
 <file path="app/graph/builder.py">
 from langgraph.graph import StateGraph, START, END
+from langgraph.prebuilt import ToolNode, tools_condition
+
 from app.graph.nodes import chatbot_node
 from app.graph.state import AgentState
-from langgraph.prebuilt import ToolNode, tools_condition
 from app.tools.tool_collection import tools
 
 graph = StateGraph(AgentState)
@@ -121,28 +162,28 @@ graph.add_node('chatbot_node', chatbot_node)
 graph.add_node('tools', ToolNode(tools))
 
 graph.add_edge(START, 'chatbot_node')
-
 graph.add_conditional_edges('chatbot_node', tools_condition)
-graph.add_edge('tools', 'chatbot_node') 
-
-agent= graph.compile()
+graph.add_edge('tools', 'chatbot_node')
 </file>
 
 <file path="app/graph/nodes.py">
+from langchain_core.runnables import RunnableConfig
 from app.graph.state import AgentState
 from app.services.gemini import get_llm
-from app.tools.tool_collection import tools
 from app.prompts.system_prompt import system_prompt
 
-def chatbot_node(state: AgentState)->AgentState:
+
+async def chatbot_node(state: AgentState, config: RunnableConfig) -> AgentState:
     messages = state.get('messages', [])
-    messages.insert(0, system_prompt)
-    
+    message_with_prompt = [system_prompt] + messages
+
     llm = get_llm()
-     
-    response = llm.invoke(messages)
-    
-    return {'messages': [response]}
+
+    full_response = None
+    async for chunk in llm.astream(message_with_prompt, config):
+        full_response = chunk if full_response is None else full_response + chunk
+
+    return {'messages': [full_response]}
 </file>
 
 <file path="app/graph/state.py">
@@ -240,28 +281,42 @@ class OrderRepository:
 import os
 from dotenv import load_dotenv
 from app.services.gemini import get_embeddings
-
+from pinecone import Pinecone
+from langchain_pinecone import PineconeVectorStore
 
 load_dotenv()
 
+
 class PolicyRepository:
     def __init__(self):
-        self.embeddings= get_embeddings()
+        self.embeddings = get_embeddings()
         self.index_name = os.getenv("PINECONE_INDEX_NAME")
-        
-        pc= PineCone(api_key=os.getenv("PINECONE_API_KEY"))
+
+        pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
         self.index = pc.Index(self.index_name)
-        
+
         self.vector_store = PineconeVectorStore(
             index=self.index,
             embedding=self.embeddings,
             text_key="text",
         )
-    
-    def search_policies(self, query: str, top_k: int=5)-> list[str]: 
+
+    def search_policies(self, query: str, top_k: int = 5) -> list[str]:
         docs = self.vector_store.similarity_search(query, k=top_k)
-        
         return [result.page_content for result in docs]
+
+
+# Module-level singleton. Building this involves creating an embeddings
+# client and opening a connection to a Pinecone index -- expensive to do
+# on every single policy lookup
+_policy_repository: PolicyRepository | None = None
+
+
+def get_policy_repository() -> PolicyRepository:
+    global _policy_repository
+    if _policy_repository is None:
+        _policy_repository = PolicyRepository()
+    return _policy_repository
 </file>
 
 <file path="app/repositories/product_repository.py">
@@ -346,7 +401,6 @@ class TicketRepository:
 import os
 from dotenv import load_dotenv
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
-from app.tools.tool_collection import tools
 
 load_dotenv()
 
@@ -354,15 +408,16 @@ api_key = os.getenv("GOOGLE_API_KEY")
 
 if not api_key:
     raise ValueError("GOOGLE_API_KEY is not set in the environment variables.")
-    
-llm = ChatGoogleGenerativeAI(model="gemini-3.1-flash-lite", api_key=api_key)
-llm = llm.bind_tools(tools)
+
+base_llm = ChatGoogleGenerativeAI(model="gemini-3.1-flash-lite", api_key=api_key, timeout=30, max_retries=3)
+base_embeddings = GoogleGenerativeAIEmbeddings(model="gemini-embedding-001", api_key=api_key, output_dimensionality=768)
 
 def get_llm():
-    return llm
+    from app.tools.tool_collection import tools
+    return base_llm.bind_tools(tools)
 
 def get_embeddings():
-    return GoogleGenerativeAIEmbeddings(model="models/embedding-001", api_key=api_key)
+    return base_embeddings
 </file>
 
 <file path="app/services/order_service.py">
@@ -392,27 +447,26 @@ class OrderService:
 </file>
 
 <file path="app/services/policy_service.py">
-from app.repositories.order_repository import PolicyRepository
-from app.database import get_db
-import json
+from app.repositories.policy_repository import get_policy_repository
+
 
 class PolicyService:
 
     @staticmethod
     def ask_policy(query: str):
-      try:
-        repo = PolicyRepository()
-        relevant_docs = repo.search_policies(query)
-        
-        if not relevant_docs:
-            return {"message": "No relevant policies found for the given query."}
-        
-        combined_docs = "\n\n---\n\n".join(relevant_docs)
-        
-        return {"retrieved_context": combined_docs}
-      
-      except Exception as e:
-        return {"error": f"An error occurred while retrieving policies: {str(e)}"}
+        try:
+            repo = get_policy_repository()
+            relevant_docs = repo.search_policies(query)
+
+            if not relevant_docs:
+                return {"message": "No relevant policies found for the given query."}
+
+            combined_docs = "\n\n---\n\n".join(relevant_docs)
+
+            return {"retrieved_context": combined_docs}
+
+        except Exception as e:
+            return {"error": f"An error occurred while retrieving policies: {str(e)}"}
 </file>
 
 <file path="app/services/product_service.py">
@@ -469,7 +523,7 @@ def order_lookup(order_id: str) -> str:
     if not order:
         return json.dumps({"error": f"Order with ID :{order_id} not found"})
     
-    return order
+    return json.dumps(order)
 </file>
 
 <file path="app/tools/policy.py">
@@ -563,10 +617,69 @@ def get_db():
 </file>
 
 <file path="app/main.py">
-from fastapi import FastAPI
-from app.api.chat import router
+import os
+from contextlib import asynccontextmanager
 
-app = FastAPI()
+from fastapi import FastAPI
+from dotenv import load_dotenv
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+
+from app.api.chat import router
+from app.graph.builder import graph
+
+load_dotenv()
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+ALLOWED_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv("ALLOWED_ORIGINS", "http://localhost:3000").split(",")
+    if origin.strip()
+]
+
+logger = logging.getLogger("uvicorn.error")
+
+DB_STARTUP_TIMEOUT_SECONDS = 10
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    if not DATABASE_URL:
+        raise RuntimeError(
+            "DATABASE_URL is not set (check that your .env file exists "
+            "and is being loaded from the right working directory)."
+        )
+
+    logger.info("Connecting to Postgres for checkpointer...")
+    try:
+        async with asyncio.timeout(DB_STARTUP_TIMEOUT_SECONDS):
+            async with AsyncPostgresSaver.from_conn_string(DATABASE_URL) as checkpointer:
+                logger.info("Connected. Running checkpointer.setup()...")
+                await checkpointer.setup()
+                logger.info("Checkpointer ready. Compiling graph...")
+                app.state.agent = graph.compile(checkpointer=checkpointer)
+                logger.info("Startup complete.")
+                yield
+    except TimeoutError:
+        raise RuntimeError(
+            f"Timed out after {DB_STARTUP_TIMEOUT_SECONDS}s connecting to "
+            "Postgres / running checkpointer.setup(). Check that "
+            "DATABASE_URL points to a reachable Postgres instance, and "
+            "that you are NOT going through a transaction-mode connection "
+            "pooler (PgBouncer/Supabase pooler/etc.) -- AsyncPostgresSaver "
+            "needs prepared-statement support, which those don't provide "
+            "in transaction pooling mode. Use the direct/session connection "
+            "string instead."
+        )
+
+
+app = FastAPI(lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 @app.get("/health")
 def health_check():
@@ -587,6 +700,9 @@ sqlalchemy
 psycopg2-binary
 pinecone-client
 langchain-pinecone
+langgraph-checkpoint-postgres 
+psycopg 
+psycopg-pool
 </file>
 
 <file path="seed_db.py">
@@ -684,6 +800,55 @@ def seed_database():
 
 if __name__ == "__main__":
     seed_database()
+</file>
+
+<file path="seed_policies.py">
+import os
+from dotenv import load_dotenv
+from app.services.gemini import get_embeddings
+from pinecone import Pinecone
+from langchain_pinecone import PineconeVectorStore
+from langchain_core.documents import Document
+
+load_dotenv()
+
+def seed_pinecone():
+    print("Connecting to Pinecone...")
+    api_key = os.getenv("PINECONE_API_KEY")
+    index_name = os.getenv("PINECONE_INDEX_NAME")
+    
+    if not api_key or not index_name:
+        raise ValueError("Ensure PINECONE_API_KEY and PINECONE_INDEX_NAME are set in your environment variables.")
+
+    pc = Pinecone(api_key=api_key)
+    index = pc.Index(index_name)
+    
+    embeddings = get_embeddings()
+    
+    # Define corporate policy mock chunks
+    sample_policies = [
+        "Return & Refund Policy: Customers can return any device within 30 days of purchase for a full refund. The item must be in its original packaging. If the item arrived damaged or broken, the return shipping fees are completely covered by us, and a replacement will be sent out immediately upon request.",
+        "Warranty Policy: All hardware electronics items sold include a 1-year limited warranty covering factory defects, hardware failures, and screen issues not caused by accidental drops or liquid damage.",
+        "Shipping Policy: Standard shipping takes 3-5 business days. Express shipping takes 1-2 business days. Orders exceeding $100 are automatically eligible for free standard shipping globally.",
+        "Support Escalation Policy: If a support ticket is generated by our engineering department, it is marked as 'Open' by default. Our internal customer success staff is strictly required to review and respond to all newly opened tickets within 24 hours."
+    ]
+    
+    # Wrap texts into LangChain Document objects
+    documents = [Document(page_content=text, metadata={"source": "company_handbook"}) for text in sample_policies]
+    
+    print(f"Generating embeddings and uploading {len(documents)} text chunks to Pinecone index '{index_name}'...")
+    
+    # This automatically runs embeddings and pushes to Pinecone
+    PineconeVectorStore.from_documents(
+        documents,
+        embedding=embeddings,
+        index_name=index_name
+    )
+    
+    print("Successfully seeded Pinecone index context!")
+
+if __name__ == "__main__":
+    seed_pinecone()
 </file>
 
 </files>

@@ -9,7 +9,7 @@ api_key = os.getenv("GOOGLE_API_KEY")
 if not api_key:
     raise ValueError("GOOGLE_API_KEY is not set in the environment variables.")
 
-base_llm = ChatGoogleGenerativeAI(model="gemini-3.1-flash-lite", api_key=api_key)
+base_llm = ChatGoogleGenerativeAI(model="gemini-3.1-flash-lite", api_key=api_key, timeout=30, max_retries=3)
 base_embeddings = GoogleGenerativeAIEmbeddings(model="gemini-embedding-001", api_key=api_key, output_dimensionality=768)
 
 def get_llm():

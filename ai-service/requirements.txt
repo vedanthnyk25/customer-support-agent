@@ -9,3 +9,6 @@ sqlalchemy
 psycopg2-binary
 pinecone-client
 langchain-pinecone
+langgraph-checkpoint-postgres 
+psycopg 
+psycopg-pool
