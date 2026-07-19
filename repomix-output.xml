@@ -73,10 +73,13 @@ ai-service/
       tool_collection.py
     database.py
     main.py
+  migration_001.py
   repomix-output.xml
   requirements.txt
   seed_db.py
   seed_policies.py
+benchmark/
+  benchmark.py
 frontend/
   app/
     chat/
@@ -136,18 +139,6 @@ class AgentState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
 </file>
 
-<file path="ai-service/app/models/order.py">
-from sqlalchemy import Column, String, Date
-from app.database import Base
-
-class Order(Base):
-    __tablename__ = "orders"
-
-    id = Column(String, primary_key=True, index=True)
-    status_code = Column(String, nullable=False)
-    delivery_date = Column(Date, nullable=False)
-</file>
-
 <file path="ai-service/app/models/product.py">
 from sqlalchemy import Column, String, Float, Integer
 from app.database import Base
@@ -172,59 +163,6 @@ class Ticket(Base):
     id = Column(String, primary_key=True, index=True)
     description = Column(Text, nullable=False)
     status = Column(String, default="Open")
-</file>
-
-<file path="ai-service/app/prompts/system_prompt.py">
-from langchain_core.messages import SystemMessage
-
-system_prompt = SystemMessage(content="""
-    You are a professional customer support agent. 
-    You have access to tools to check orders, products, and company policies.
-    
-    CRITICAL RULE FOR POLICIES: When a user asks about returns, warranties, or rules, 
-    you MUST use the policy_lookup tool. You must base your answer EXCLUSIVELY on the 
-    retrieved context. If the retrieved context does not contain the answer, do not guess. 
-    Simply state that you do not have that specific information and offer to create a support ticket.
-    """)
-</file>
-
-<file path="ai-service/app/repositories/product_repository.py">
-from sqlalchemy.orm import Session
-from app.models.product import Product
-from typing import List, Dict, Any
-from pydantic import BaseModel
-
-class ProductDTO(BaseModel):
-    id: str
-    name: str
-    price: float
-    in_stock: bool
-    stock_left: int
-
-
-class ProductRepository:
-    def __init__(self, db_session: Session):
-        self.db = db_session
-
-    def search_products(self, search_term: str) -> List[ProductDTO]:
-        # Using ilike allows us to find "Mouse" even if the user types "mouse"
-        # The % symbols act as wildcards (e.g., matches "Wireless Mouse Pro")
-        search_pattern = f"%{search_term}%"
-        
-        results = self.db.query(Product).filter(
-            Product.name.ilike(search_pattern)
-        ).limit(5).all() # Limit to 5 so we don't overwhelm the LLM context window
-        
-        return [
-            ProductDTO(
-                id=p.id,
-                name=p.name,
-                price=p.price,
-                in_stock=p.stock_quantity > 0,
-                stock_left=p.stock_quantity
-            )
-            for p in results
-        ]
 </file>
 
 <file path="ai-service/app/repositories/ticket_repository.py">
@@ -264,27 +202,6 @@ class TicketRepository:
             description=new_ticket.description,
             status=new_ticket.status
         )
-</file>
-
-<file path="ai-service/app/services/product_service.py">
-from app.database import get_db
-from app.repositories.product_repository import ProductRepository
-import json
-
-class ProductService:
-    @staticmethod
-    def search(search_term: str):
-        db_session = next(get_db())
-        try:
-            repo = ProductRepository(db_session)
-            products = repo.search_products(search_term)
-            
-            if not products:
-                return {"message": f"No products found matching '{search_term}'."}
-                
-            return {"results": [p.model_dump() for p in products]}
-        finally:
-            db_session.close()
 </file>
 
 <file path="ai-service/app/services/ticket_service.py">
@@ -386,6 +303,43 @@ def get_db():
         db.close()
 </file>
 
+<file path="ai-service/migration_001.py">
+"""
+One-off migration: adds product_id, quantity, total_price columns to the
+existing `orders` table.
+
+Why this is needed: Base.metadata.create_all() (used in seed_db.py) only
+creates tables that don't exist yet -- it will NOT alter a table that's
+already there. Since `orders` already exists from your first seed run,
+the new columns on the Order model won't show up in the actual database
+until you run this once.
+
+Usage:
+    python migrate_add_order_columns.py
+"""
+
+from sqlalchemy import text
+from app.database import engine
+
+STATEMENTS = [
+    "ALTER TABLE orders ADD COLUMN IF NOT EXISTS product_id VARCHAR",
+    "ALTER TABLE orders ADD COLUMN IF NOT EXISTS quantity INTEGER",
+    "ALTER TABLE orders ADD COLUMN IF NOT EXISTS total_price FLOAT",
+]
+
+
+def migrate():
+    with engine.begin() as conn:
+        for stmt in STATEMENTS:
+            print(f"Running: {stmt}")
+            conn.execute(text(stmt))
+    print("Done.")
+
+
+if __name__ == "__main__":
+    migrate()
+</file>
+
 <file path="ai-service/seed_policies.py">
 import os
 from dotenv import load_dotenv
@@ -433,6 +387,350 @@ def seed_pinecone():
 
 if __name__ == "__main__":
     seed_pinecone()
+</file>
+
+<file path="benchmark/benchmark.py">
+"""
+Agentic Support Bot -- Quantitative Benchmark Suite
+=====================================================
+
+Produces the kind of numbers that belong on a resume, measured against
+your OWN running deployment -- nothing here is fabricated or estimated.
+Run it, read the printed report, and plug the REAL numbers it prints
+into the bullet templates at the bottom of this file's companion notes.
+
+Measures:
+  1. Time-to-first-token (TTFT) and total latency percentiles (p50/p95/p99)
+  2. Sustained throughput (req/s) under configurable concurrency
+  3. Error / failure rate under load
+  4. Task success rate against a labeled query set (a lightweight eval
+     harness -- checks whether the agent's final answer contains the
+     expected signal for each category: order lookup, product lookup,
+     policy RAG, ticket creation, and multi-turn memory)
+
+Usage:
+    pip install httpx --break-system-packages
+    python benchmark.py --base-url http://localhost:8000 \
+        --concurrency 10 --requests 100 --order-id ORD-1001 --product-name "Wireless Mouse X200"
+
+IMPORTANT: before running, edit LABELED_TEST_SET below so the order ID /
+product name / policy keywords match data that actually exists in your
+seeded database and Pinecone index. Test cases with placeholder data
+will fail for the wrong reason (not-found, not agent inaccuracy).
+"""
+
+import argparse
+import asyncio
+import json
+import statistics
+import time
+import uuid
+from dataclasses import dataclass, field
+
+import httpx
+
+
+# ---------------------------------------------------------------------------
+# Labeled test set -- EDIT THIS to match your real seeded data.
+# ---------------------------------------------------------------------------
+
+@dataclass
+class TestCase:
+    category: str
+    query: str
+    # A response is scored PASS if it contains any of these substrings
+    # (case-insensitive). Keep this to genuinely diagnostic keywords --
+    # e.g. an order status reply should mention the order id or a status
+    # word; a policy answer should mention the policy topic.
+    expect_any: list[str]
+    # Optional: substrings that should NOT appear (e.g. hallucination
+    # markers, or "I don't know" style refusals for something in scope).
+    expect_none: list[str] = field(default_factory=list)
+
+
+LABELED_TEST_SET = [
+    TestCase(
+        category="order_lookup",
+        query="What is the status of order ORD-1001?",
+        expect_any=["ORD-1001", "shipped", "delivered", "processing", "pending", "transit"],
+        expect_none=["i don't have access", "i do not have access"],
+    ),
+    TestCase(
+        category="product_lookup",
+        query="Tell me about the Wireless Mouse X200",
+        expect_any=["wireless mouse", "x200"],
+        expect_none=["i don't have access", "i do not have access"],
+    ),
+    TestCase(
+        category="policy_rag",
+        query="What is your return policy?",
+        expect_any=["return", "refund", "days"],
+        expect_none=[],
+    ),
+    TestCase(
+        category="ticket_creation",
+        query="I'd like to open a support ticket, my item arrived broken.",
+        expect_any=["ticket", "created", "escalat", "support team"],
+        expect_none=[],
+    ),
+    TestCase(
+        category="out_of_scope_guardrail",
+        query="What's the weather like today?",
+        expect_any=["i don't have access", "i do not have access", "i can't help", "i cannot help", "unable"],
+        expect_none=[],
+    ),
+]
+
+
+# ---------------------------------------------------------------------------
+# Core client
+# ---------------------------------------------------------------------------
+
+async def stream_chat(client: httpx.AsyncClient, base_url: str, message: str, thread_id: str) -> dict:
+    """Send one message, consume the SSE stream, and time it."""
+    start = time.perf_counter()
+    ttft = None
+    full_text = ""
+    error = None
+    status_code = None
+
+    try:
+        async with client.stream(
+            "POST", f"{base_url}/api/chat",
+            json={"message": message, "thread_id": thread_id},
+        ) as resp:
+            status_code = resp.status_code
+            if resp.status_code != 200:
+                return {"latency": None, "ttft": None, "text": "", "error": f"HTTP {resp.status_code}"}
+
+            async for line in resp.aiter_lines():
+                if not line.startswith("data: "):
+                    continue
+                data = line[6:].strip()
+                if not data or data == "[DONE]":
+                    continue
+                try:
+                    parsed = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+
+                if "chunk" in parsed:
+                    if ttft is None:
+                        ttft = time.perf_counter() - start
+                    full_text += parsed["chunk"]
+                if "error" in parsed:
+                    error = parsed["error"]
+    except (httpx.ConnectError, httpx.ReadTimeout, httpx.RemoteProtocolError) as e:
+        error = f"{type(e).__name__}: {e}"
+
+    total_latency = time.perf_counter() - start
+    return {
+        "latency": total_latency,
+        "ttft": ttft,
+        "text": full_text,
+        "error": error,
+        "status_code": status_code,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 1. Latency / throughput benchmark
+# ---------------------------------------------------------------------------
+
+def percentile(data: list[float], p: float) -> float:
+    data = sorted(data)
+    if not data:
+        return 0.0
+    k = (len(data) - 1) * (p / 100)
+    f = int(k)
+    c = min(f + 1, len(data) - 1)
+    if f == c:
+        return data[f]
+    return data[f] + (data[c] - data[f]) * (k - f)
+
+
+class RateLimiter:
+    """Paces request starts so we don't exceed a target requests-per-minute
+    ceiling. Necessary on the Gemini free tier (~15 RPM for flash-lite as
+    of mid-2026, though this can change -- check Google AI Studio for your
+    project's actual current limit). Each chat turn can cost 1-2 real
+    Gemini calls (tool-selection call + final-answer call), so `max_rpm`
+    here should be set conservatively below your raw API RPM limit."""
+
+    def __init__(self, max_rpm: int):
+        self.min_interval = 60.0 / max_rpm if max_rpm > 0 else 0.0
+        self._last_start = 0.0
+        self._lock = asyncio.Lock()
+
+    async def wait_turn(self):
+        if self.min_interval <= 0:
+            return
+        async with self._lock:
+            now = time.perf_counter()
+            wait = self._last_start + self.min_interval - now
+            if wait > 0:
+                await asyncio.sleep(wait)
+            self._last_start = time.perf_counter()
+
+
+async def run_load_test(
+    base_url: str, concurrency: int, total_requests: int, query: str, max_rpm: int
+) -> tuple[list[dict], float]:
+    results: list[dict] = []
+    sem = asyncio.Semaphore(concurrency)
+    limiter = RateLimiter(max_rpm)
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        async def worker(_: int):
+            await limiter.wait_turn()
+            async with sem:
+                thread_id = str(uuid.uuid4())  # each simulated user gets its own thread
+                r = await stream_chat(client, base_url, query, thread_id)
+                results.append(r)
+
+        wall_start = time.perf_counter()
+        await asyncio.gather(*(worker(i) for i in range(total_requests)))
+        wall_clock = time.perf_counter() - wall_start
+
+    return results, wall_clock
+
+
+def print_load_summary(results: list[dict], wall_clock: float, concurrency: int):
+    n = len(results)
+    errors = [r for r in results if r.get("error")]
+    latencies = [r["latency"] for r in results if r.get("latency") is not None and not r.get("error")]
+    ttfts = [r["ttft"] for r in results if r.get("ttft") is not None]
+
+    print("\n" + "=" * 60)
+    print(f"LOAD TEST  ({n} requests, concurrency={concurrency})")
+    print("=" * 60)
+    print(f"Wall clock time:      {wall_clock:.2f}s")
+    print(f"Throughput:           {n / wall_clock:.2f} req/s")
+    print(f"Success rate:         {(n - len(errors)) / n * 100:.1f}%  ({len(errors)} errors / {n})")
+    if errors:
+        sample = errors[0].get("error")
+        print(f"  (sample error: {sample})")
+
+    if latencies:
+        print("\nTotal response latency (full generation, incl. any tool calls):")
+        print(f"  p50: {percentile(latencies, 50) * 1000:.0f} ms")
+        print(f"  p95: {percentile(latencies, 95) * 1000:.0f} ms")
+        print(f"  p99: {percentile(latencies, 99) * 1000:.0f} ms")
+        print(f"  max: {max(latencies) * 1000:.0f} ms")
+        print(f"  mean: {statistics.mean(latencies) * 1000:.0f} ms")
+
+    if ttfts:
+        print("\nTime to first token (TTFT):")
+        print(f"  p50: {percentile(ttfts, 50) * 1000:.0f} ms")
+        print(f"  p95: {percentile(ttfts, 95) * 1000:.0f} ms")
+        print(f"  mean: {statistics.mean(ttfts) * 1000:.0f} ms")
+
+
+# ---------------------------------------------------------------------------
+# 2. Task success rate (labeled eval)
+# ---------------------------------------------------------------------------
+
+async def run_eval(base_url: str, max_rpm: int) -> list[dict]:
+    results = []
+    limiter = RateLimiter(max_rpm)
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        for case in LABELED_TEST_SET:
+            await limiter.wait_turn()
+            thread_id = str(uuid.uuid4())
+            r = await stream_chat(client, base_url, case.query, thread_id)
+            text_lower = r["text"].lower()
+
+            has_expected = any(kw.lower() in text_lower for kw in case.expect_any) if case.expect_any else True
+            has_forbidden = any(kw.lower() in text_lower for kw in case.expect_none)
+            passed = has_expected and not has_forbidden and not r.get("error")
+
+            results.append({
+                "category": case.category,
+                "query": case.query,
+                "passed": passed,
+                "response": r["text"],
+                "error": r.get("error"),
+            })
+    return results
+
+
+def print_eval_summary(results: list[dict]):
+    print("\n" + "=" * 60)
+    print("TASK SUCCESS RATE (labeled eval set)")
+    print("=" * 60)
+    passed = sum(1 for r in results if r["passed"])
+    print(f"Overall: {passed}/{len(results)} passed  ({passed / len(results) * 100:.0f}%)\n")
+    for r in results:
+        status = "PASS" if r["passed"] else "FAIL"
+        print(f"[{status}] {r['category']:<20} \"{r['query']}\"")
+        if not r["passed"]:
+            snippet = (r["response"] or r.get("error") or "")[:150]
+            print(f"       -> {snippet}")
+
+
+# ---------------------------------------------------------------------------
+# 3. Multi-turn memory check
+# ---------------------------------------------------------------------------
+
+async def run_memory_check(base_url: str) -> bool:
+    print("\n" + "=" * 60)
+    print("MULTI-TURN MEMORY CHECK")
+    print("=" * 60)
+    thread_id = str(uuid.uuid4())
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        turn1 = await stream_chat(client, base_url, "My name is Vedanth and my order ID is ORD-1001.", thread_id)
+        turn2 = await stream_chat(client, base_url, "What is my name and order ID?", thread_id)
+
+    passed = "vedanth" in turn2["text"].lower() and "ord-1001" in turn2["text"].lower()
+    print(f"Turn 1: {turn1['text'][:100]}")
+    print(f"Turn 2: {turn2['text'][:150]}")
+    print(f"Result: {'PASS -- context persisted correctly' if passed else 'FAIL -- context not retained'}")
+    return passed
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+async def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--base-url", default="http://localhost:8000")
+    parser.add_argument("--concurrency", type=int, default=3)
+    parser.add_argument("--requests", type=int, default=15)
+    parser.add_argument(
+        "--max-rpm", type=int, default=8,
+        help="Cap on real chat-turn starts per minute. Keep this well below "
+             "your Gemini project's raw RPM limit (visible in AI Studio) "
+             "since each turn can cost 1-2 actual API calls (tool-selection "
+             "+ final answer). Default of 8 leaves headroom under a 15 RPM "
+             "free-tier ceiling.",
+    )
+    parser.add_argument(
+        "--load-query", default="What is the status of order ORD-1001?",
+        help="Query used for the raw load/latency test (keep it a real, valid case).",
+    )
+    args = parser.parse_args()
+
+    print(f"Target: {args.base_url}")
+    print(f"Rate-limited to ~{args.max_rpm} chat turns/min to stay under free-tier quota.\n")
+
+    results, wall_clock = await run_load_test(
+        args.base_url, args.concurrency, args.requests, args.load_query, args.max_rpm
+    )
+    print_load_summary(results, wall_clock, args.concurrency)
+
+    eval_results = await run_eval(args.base_url, args.max_rpm)
+    print_eval_summary(eval_results)
+
+    await run_memory_check(args.base_url)
+
+    print("\n" + "=" * 60)
+    print("Done. Use the numbers above -- not estimates -- for your resume.")
+    print("=" * 60)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
 </file>
 
 <file path="frontend/app/chat/page.tsx">
@@ -941,213 +1239,6 @@ function Button({
 export { Button, buttonVariants }
 </file>
 
-<file path="frontend/components/chat-container.tsx">
-'use client'
-
-import { useState, useRef, useEffect } from 'react'
-import { MessageList } from './message-list'
-import { ChatInput } from './chat-input'
-
-export interface Message {
-  id: string
-  role: 'user' | 'assistant'
-  content: string
-  timestamp: Date
-}
-
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
-
-export function ChatContainer() {
-  const [messages, setMessages] = useState<Message[]>([
-    {
-      id: '0',
-      role: 'assistant',
-      content: 'Hello. I am your support agent. Ask me about orders, products, policies, or create a support ticket.',
-      timestamp: new Date(),
-    },
-  ])
-  const [isLoading, setIsLoading] = useState(false)
-
-  // Generate a stable per-session thread id up front instead of starting
-  // from ''. Previously every user's *first* message was sent with
-  // thread_id: '' -- since that's an explicit (non-omitted) field value,
-  // the backend's default_factory never kicks in, so every new user's
-  // first message landed in the SAME shared conversation thread until
-  // the server handed back a real UUID. Generating it client-side fixes
-  // that entirely.
-  const [threadId] = useState<string>(() =>
-    typeof crypto !== 'undefined' && crypto.randomUUID
-      ? crypto.randomUUID()
-      : `thread-${Date.now()}-${Math.random().toString(36).slice(2)}`
-  )
-
-  const messagesEndRef = useRef<HTMLDivElement>(null)
-
-  const scrollToBottom = () => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
-  }
-
-  useEffect(() => {
-    scrollToBottom()
-  }, [messages])
-
-  const handleSendMessage = async (content: string) => {
-    if (!content.trim()) return
-
-    const userMessage: Message = {
-      id: Date.now().toString(),
-      role: 'user',
-      content,
-      timestamp: new Date(),
-    }
-
-    setMessages((prev) => [...prev, userMessage])
-    setIsLoading(true)
-
-    try {
-      const response = await fetch(`${API_BASE}/api/chat`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          message: content,
-          thread_id: threadId,
-        }),
-      })
-
-      if (!response.ok) {
-        throw new Error(`API error: ${response.statusText}`)
-      }
-
-      if (!response.body) {
-        throw new Error('No response body')
-      }
-
-      const reader = response.body.getReader()
-      const decoder = new TextDecoder()
-
-      const assistantId = `assistant-${Date.now()}`
-      let messageAdded = false
-
-      let fullText = ''
-      let revealedLength = 0
-      let streamDone = false
-      let animationFrameId: number | null = null
-      const REVEAL_CHARS_PER_FRAME = 2 // higher = faster typing
-
-      const tick = () => {
-        if (revealedLength < fullText.length) {
-          revealedLength = Math.min(revealedLength + REVEAL_CHARS_PER_FRAME, fullText.length)
-          const visibleText = fullText.slice(0, revealedLength)
-
-          setMessages((prev) => {
-            const updated = [...prev]
-            const lastIndex = updated.length - 1
-            if (updated[lastIndex]?.id === assistantId) {
-              updated[lastIndex] = { ...updated[lastIndex], content: visibleText }
-            }
-            return updated
-          })
-        }
-
-        if (!streamDone || revealedLength < fullText.length) {
-          animationFrameId = requestAnimationFrame(tick)
-        } else {
-          animationFrameId = null
-        }
-      }
-
-      // Buffer across reads: a single "data: {...}\n\n" SSE event can be
-      // split across multiple network chunks / reader.read() calls. If
-      // we naively split each chunk on '\n' independently, a line can
-      // arrive truncated, fail JSON.parse, and get silently dropped as
-      // a SyntaxError -- quietly eating part of the response. Instead
-      // we accumulate into `buffer` and only process lines once we know
-      // they're complete (i.e. everything before the last, possibly
-      // incomplete, trailing segment).
-      let buffer = ''
-
-      try {
-        while (true) {
-          const { done, value } = await reader.read()
-          if (done) break
-
-          buffer += decoder.decode(value, { stream: true })
-
-          const lines = buffer.split('\n')
-          buffer = lines.pop() ?? ''
-
-          for (const line of lines) {
-            if (!line.startsWith('data: ')) continue
-
-            const data = line.slice(6).trim()
-            if (!data || data === '[DONE]') continue
-
-            try {
-              const parsed = JSON.parse(data)
-
-              if (parsed.chunk) {
-                fullText += parsed.chunk
-
-                if (!messageAdded) {
-                  setMessages((prev) => [
-                    ...prev,
-                    {
-                      id: assistantId,
-                      role: 'assistant',
-                      content: '',
-                      timestamp: new Date(),
-                    },
-                  ])
-                  messageAdded = true
-                  animationFrameId = requestAnimationFrame(tick)
-                }
-              }
-
-              if (parsed.error) {
-                throw new Error(parsed.error)
-              }
-            } catch (e) {
-              if (e instanceof SyntaxError) continue
-              throw e
-            }
-          }
-        }
-      } finally {
-        streamDone = true
-        // If nothing was ever added (e.g. an empty/errored response with
-        // no chunks), there's no animation loop running to clean up.
-        if (animationFrameId === null && messageAdded && revealedLength < fullText.length) {
-          animationFrameId = requestAnimationFrame(tick)
-        }
-      }
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : 'Failed to send message'
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: `error-${Date.now()}`,
-          role: 'assistant',
-          content: `Error: ${errorMessage}`,
-          timestamp: new Date(),
-        },
-      ])
-    } finally {
-      setIsLoading(false)
-    }
-  }
-
-  return (
-    <div className="flex-1 flex flex-col overflow-hidden">
-      <MessageList messages={messages} />
-      <div ref={messagesEndRef} />
-      <ChatInput onSendMessage={handleSendMessage} isLoading={isLoading} />
-    </div>
-  )
-}
-</file>
-
 <file path="frontend/components/chat-input.tsx">
 'use client'
 
@@ -1224,42 +1315,6 @@ export function Header() {
         </p>
       </div>
     </header>
-  )
-}
-</file>
-
-<file path="frontend/components/message-list.tsx">
-import { Message } from './chat-container'
-
-interface MessageListProps {
-  messages: Message[]
-}
-
-export function MessageList({ messages }: MessageListProps) {
-  return (
-    <div className="flex-1 overflow-y-auto px-6 py-8 space-y-6">
-      <div className="max-w-4xl mx-auto space-y-6">
-        {messages.map((message) => (
-          <div
-            key={message.id}
-            className={`flex ${message.role === 'user' ? 'justify-end' : 'justify-start'}`}
-          >
-            <div
-              className={`max-w-2xl ${
-                message.role === 'user'
-                  ? 'bg-white text-black border-2 border-white'
-                  : 'bg-transparent text-white border-2 border-gray-700'
-              } p-4 font-mono text-sm leading-relaxed break-words`}
-            >
-              <div className="font-black text-xs tracking-wider mb-2 opacity-70">
-                {message.role === 'user' ? 'YOU' : 'AGENT'}
-              </div>
-              <div className="whitespace-pre-wrap">{message.content}</div>
-            </div>
-          </div>
-        ))}
-      </div>
-    </div>
   )
 }
 </file>
@@ -2559,34 +2614,47 @@ export default config
 ai-service/.venv
 </file>
 
-<file path="ai-service/app/repositories/order_repository.py">
-from sqlalchemy.orm import Session
-from app.models.order import Order
-from typing import Dict, Any, Optional
-from pydantic import BaseModel
+<file path="ai-service/app/models/order.py">
+from sqlalchemy import Column, String, Date, Integer, Float
+from app.database import Base
 
-class OrderDTO(BaseModel):
-    id: str
-    status_code: str
-    delivery_date: str
 
-class OrderRepository:
-    def __init__(self, db_session: Session):
-        self.db = db_session
+class Order(Base):
+    __tablename__ = "orders"
 
-    def get_order_by_id(self, order_id: str) -> Optional[OrderDTO]:
-        # Query the database for the order
-        order_record = self.db.query(Order).filter(Order.id == order_id).first()
-        
-        if not order_record:
-            return None
-            
-        # Return it as a dictionary so the Service layer can process it
-        return OrderDTO(
-            id=order_record.id,
-            status_code=order_record.status_code,
-            delivery_date=str(order_record.delivery_date)
-        )
+    id = Column(String, primary_key=True, index=True)
+    status_code = Column(String, nullable=False)
+    delivery_date = Column(Date, nullable=False)
+    product_id = Column(String, nullable=True)
+    quantity = Column(Integer, nullable=True)
+    total_price = Column(Float, nullable=True)
+</file>
+
+<file path="ai-service/app/prompts/system_prompt.py">
+from langchain_core.messages import SystemMessage
+
+system_prompt = SystemMessage(
+    content="""
+    You are a professional customer support agent.
+    You have access to tools to check orders, products, company policies, and to place new orders.
+
+    CRITICAL RULE FOR POLICIES: When a user asks about returns, warranties, or rules,
+    you MUST use the policy_lookup tool. You must base your answer EXCLUSIVELY on the
+    retrieved context. If the retrieved context does not contain the answer, do not guess.
+    Simply state that you do not have that specific information and offer to create a support ticket.
+
+    CRITICAL RULE FOR PLACING ORDERS: When a user wants to buy or order a product:
+    1. First use product_lookup to find the exact product and its product_id.
+    2. Once you know the product_id and quantity, call place_order directly.
+    3. Do NOT ask the user to confirm the order yourself in your own text response --
+       the place_order tool has a built-in confirmation step that handles this
+       automatically. Asking for confirmation yourself before calling the tool
+       would be redundant and confusing.
+    4. After place_order returns, report the result plainly (order created with its
+       ID, or that the order was cancelled/not confirmed, or any error such as
+       insufficient stock).
+    """
+    )
 </file>
 
 <file path="ai-service/app/repositories/policy_repository.py">
@@ -2631,30 +2699,62 @@ def get_policy_repository() -> PolicyRepository:
     return _policy_repository
 </file>
 
-<file path="ai-service/app/services/order_service.py">
-from app.repositories.order_repository import OrderRepository
-from app.database import get_db
-import json
+<file path="ai-service/app/repositories/product_repository.py">
+from sqlalchemy.orm import Session
+from app.models.product import Product
+from typing import List, Optional
+from pydantic import BaseModel
 
-class OrderService:
 
-    @staticmethod
-    def lookup(order_id: str):
-        db_session = next(get_db()) 
-    
-        try:
-        # Instantiate layers
-            repo = OrderRepository(db_session)
-            
-            order_data = repo.get_order_by_id(order_id)
-            
-            if not order_data:
-                return {"error": f"Order with ID :{order_id} not found"}
-            
-            return order_data.model_dump()  # Convert Pydantic model to dictionary for JSON serialization
-        finally:
-        # Ensure the connection is released back to the pool
-            db_session.close()
+class ProductDTO(BaseModel):
+    id: str
+    name: str
+    price: float
+    in_stock: bool
+    stock_left: int
+
+
+class ProductRepository:
+    def __init__(self, db_session: Session):
+        self.db = db_session
+
+    def search_products(self, search_term: str) -> List[ProductDTO]:
+        search_pattern = f"%{search_term}%"
+
+        results = self.db.query(Product).filter(
+            Product.name.ilike(search_pattern)
+        ).limit(5).all()
+
+        return [
+            ProductDTO(
+                id=p.id,
+                name=p.name,
+                price=p.price,
+                in_stock=p.stock_quantity > 0,
+                stock_left=p.stock_quantity
+            )
+            for p in results
+        ]
+
+    def get_product_by_id(self, product_id: str) -> Optional[ProductDTO]:
+        p = self.db.query(Product).filter(Product.id == product_id).first()
+        if not p:
+            return None
+        return ProductDTO(
+            id=p.id,
+            name=p.name,
+            price=p.price,
+            in_stock=p.stock_quantity > 0,
+            stock_left=p.stock_quantity,
+        )
+
+    def decrement_stock(self, product_id: str, quantity: int) -> None:
+        """Stages the stock decrement in the current session. Does NOT
+        commit -- the caller commits this together with order creation."""
+        product = self.db.query(Product).filter(Product.id == product_id).first()
+        if product:
+            product.stock_quantity = max(product.stock_quantity - quantity, 0)
+            self.db.add(product)
 </file>
 
 <file path="ai-service/app/services/policy_service.py">
@@ -2680,22 +2780,37 @@ class PolicyService:
             return {"error": f"An error occurred while retrieving policies: {str(e)}"}
 </file>
 
-<file path="ai-service/app/tools/order.py">
-from langchain_core.tools import tool
-import json
-from app.services.order_service import OrderService
+<file path="ai-service/app/services/product_service.py">
+from app.database import get_db
+from app.repositories.product_repository import ProductRepository
 
-@tool
-def order_lookup(order_id: str) -> str:
-    """
-    Look up an order by its ID.
-    """
-    
-    order= OrderService.lookup(order_id)
-    if not order:
-        return json.dumps({"error": f"Order with ID :{order_id} not found"})
-    
-    return json.dumps(order)
+
+class ProductService:
+    @staticmethod
+    def search(search_term: str):
+        db_session = next(get_db())
+        try:
+            repo = ProductRepository(db_session)
+            products = repo.search_products(search_term)
+
+            if not products:
+                return {"message": f"No products found matching '{search_term}'."}
+
+            return {"results": [p.model_dump() for p in products]}
+        finally:
+            db_session.close()
+
+    @staticmethod
+    def get_by_id(product_id: str):
+        db_session = next(get_db())
+        try:
+            repo = ProductRepository(db_session)
+            product = repo.get_product_by_id(product_id)
+            if not product:
+                return {"error": f"Product with ID {product_id} not found."}
+            return product.model_dump()
+        finally:
+            db_session.close()
 </file>
 
 <file path="ai-service/seed_db.py">
@@ -2795,6 +2910,523 @@ if __name__ == "__main__":
     seed_database()
 </file>
 
+<file path="frontend/components/chat-container.tsx">
+'use client'
+
+import { useState, useRef, useEffect } from 'react'
+import { MessageList } from './message-list'
+import { ChatInput } from './chat-input'
+
+export interface OrderConfirmationPayload {
+  type: string
+  product_id: string
+  product_name: string
+  quantity: number
+  unit_price: number
+  total_price: number
+}
+
+export interface Message {
+  id: string
+  role: 'user' | 'assistant'
+  content: string
+  timestamp: Date
+  confirmation?: {
+    payload: OrderConfirmationPayload
+    threadId: string
+    resolved: boolean
+  }
+}
+
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
+
+// Reveals text on a steady per-frame cadence, decoupled from how bursty
+// the underlying SSE chunk arrival is (see earlier fix -- short replies
+// can have all their chunks land within milliseconds of each other).
+function createTypewriter(
+  setMessages: React.Dispatch<React.SetStateAction<Message[]>>,
+  messageId: string
+) {
+  let fullText = ''
+  let revealedLength = 0
+  let streamDone = false
+  let frameId: number | null = null
+  const CHARS_PER_FRAME = 2
+
+  const tick = () => {
+    if (revealedLength < fullText.length) {
+      revealedLength = Math.min(revealedLength + CHARS_PER_FRAME, fullText.length)
+      const visible = fullText.slice(0, revealedLength)
+      setMessages((prev) => {
+        const updated = [...prev]
+        const idx = updated.findIndex((m) => m.id === messageId)
+        if (idx !== -1) updated[idx] = { ...updated[idx], content: visible }
+        return updated
+      })
+    }
+    frameId = !streamDone || revealedLength < fullText.length ? requestAnimationFrame(tick) : null
+  }
+
+  return {
+    feed(text: string) {
+      fullText += text
+      if (frameId === null) frameId = requestAnimationFrame(tick)
+    },
+    finish() {
+      streamDone = true
+      if (frameId === null && revealedLength < fullText.length) {
+        frameId = requestAnimationFrame(tick)
+      }
+    },
+  }
+}
+
+export function ChatContainer() {
+  const [messages, setMessages] = useState<Message[]>([
+    {
+      id: '0',
+      role: 'assistant',
+      content: 'Hello. I am your support agent. Ask me about orders, products, policies, or create a support ticket.',
+      timestamp: new Date(),
+    },
+  ])
+  const [isLoading, setIsLoading] = useState(false)
+
+  const [threadId] = useState<string>(() =>
+    typeof crypto !== 'undefined' && crypto.randomUUID
+      ? crypto.randomUUID()
+      : `thread-${Date.now()}-${Math.random().toString(36).slice(2)}`
+  )
+
+  const messagesEndRef = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+  }, [messages])
+
+  /**
+   * Consumes an SSE response from either /api/chat or /api/chat/resume.
+   * Both endpoints emit the same event shapes ({chunk}, {type: "confirmation_required", payload},
+   * {error}, [DONE]), so this logic is fully shared between a fresh send
+   * and a post-confirmation resume.
+   */
+  async function consumeStream(response: Response) {
+    if (!response.ok) throw new Error(`API error: ${response.statusText}`)
+    if (!response.body) throw new Error('No response body')
+
+    const reader = response.body.getReader()
+    const decoder = new TextDecoder()
+
+    let assistantId: string | null = null
+    let typewriter: ReturnType<typeof createTypewriter> | null = null
+
+    // Buffer across reads -- a single "data: {...}\n\n" event can be split
+    // across multiple network chunks/reader.read() calls.
+    let buffer = ''
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+
+        buffer += decoder.decode(value, { stream: true })
+        const lines = buffer.split('\n')
+        buffer = lines.pop() ?? ''
+
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue
+          const data = line.slice(6).trim()
+          if (!data || data === '[DONE]') continue
+
+          let parsed: any
+          try {
+            parsed = JSON.parse(data)
+          } catch {
+            continue
+          }
+
+          if (parsed.chunk) {
+            if (!assistantId) {
+              assistantId = `assistant-${Date.now()}`
+              setMessages((prev) => [
+                ...prev,
+                { id: assistantId!, role: 'assistant', content: '', timestamp: new Date() },
+              ])
+              typewriter = createTypewriter(setMessages, assistantId)
+            }
+            typewriter?.feed(parsed.chunk)
+          }
+
+          if (parsed.type === 'confirmation_required') {
+            setMessages((prev) => [
+              ...prev,
+              {
+                id: `confirm-${Date.now()}`,
+                role: 'assistant',
+                content: '',
+                timestamp: new Date(),
+                confirmation: { payload: parsed.payload, threadId, resolved: false },
+              },
+            ])
+          }
+
+          if (parsed.error) {
+            throw new Error(parsed.error)
+          }
+        }
+      }
+    } finally {
+      typewriter?.finish()
+    }
+  }
+
+  const handleSendMessage = async (content: string) => {
+    if (!content.trim()) return
+
+    setMessages((prev) => [
+      ...prev,
+      { id: Date.now().toString(), role: 'user', content, timestamp: new Date() },
+    ])
+    setIsLoading(true)
+
+    try {
+      const response = await fetch(`${API_BASE}/api/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: content, thread_id: threadId }),
+      })
+      await consumeStream(response)
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : 'Failed to send message'
+      setMessages((prev) => [
+        ...prev,
+        { id: `error-${Date.now()}`, role: 'assistant', content: `Error: ${msg}`, timestamp: new Date() },
+      ])
+    } finally {
+      setIsLoading(false)
+    }
+  }
+
+  const handleConfirmOrder = async (confirmMessageId: string, confirmed: boolean) => {
+    // Mark this confirmation card resolved so its buttons disappear, and
+    // record the user's choice as a small inline note.
+    setMessages((prev) =>
+      prev.map((m) =>
+        m.id === confirmMessageId && m.confirmation
+          ? { ...m, confirmation: { ...m.confirmation, resolved: true } }
+          : m
+      )
+    )
+    setIsLoading(true)
+
+    try {
+      const response = await fetch(`${API_BASE}/api/chat/resume`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ thread_id: threadId, confirmed }),
+      })
+      await consumeStream(response)
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : 'Failed to resume'
+      setMessages((prev) => [
+        ...prev,
+        { id: `error-${Date.now()}`, role: 'assistant', content: `Error: ${msg}`, timestamp: new Date() },
+      ])
+    } finally {
+      setIsLoading(false)
+    }
+  }
+
+  return (
+    <div className="flex-1 flex flex-col overflow-hidden">
+      <MessageList messages={messages} onConfirmOrder={handleConfirmOrder} />
+      <div ref={messagesEndRef} />
+      <ChatInput onSendMessage={handleSendMessage} isLoading={isLoading} />
+    </div>
+  )
+}
+</file>
+
+<file path="frontend/components/message-list.tsx">
+import { Message } from './chat-container'
+
+interface MessageListProps {
+  messages: Message[]
+  onConfirmOrder: (messageId: string, confirmed: boolean) => void
+}
+
+export function MessageList({ messages, onConfirmOrder }: MessageListProps) {
+  return (
+    <div className="flex-1 overflow-y-auto px-6 py-8 space-y-6">
+      <div className="max-w-4xl mx-auto space-y-6">
+        {messages.map((message) => {
+          if (message.confirmation) {
+            const { payload, resolved } = message.confirmation
+            return (
+              <div key={message.id} className="flex justify-start">
+                <div className="max-w-2xl w-full bg-transparent border-2 border-yellow-500 p-4 font-mono text-sm">
+                  <div className="font-black text-xs tracking-wider mb-3 text-yellow-500">
+                    CONFIRM ORDER
+                  </div>
+                  <div className="text-white space-y-1 mb-4">
+                    <div>{payload.product_name} x{payload.quantity}</div>
+                    <div className="text-gray-400">
+                      ${payload.unit_price.toFixed(2)} each &middot; Total: ${payload.total_price.toFixed(2)}
+                    </div>
+                  </div>
+                  {!resolved ? (
+                    <div className="flex gap-3">
+                      <button
+                        onClick={() => onConfirmOrder(message.id, true)}
+                        className="px-4 py-2 bg-white text-black border-2 border-white font-black text-xs hover:bg-gray-100"
+                      >
+                        CONFIRM
+                      </button>
+                      <button
+                        onClick={() => onConfirmOrder(message.id, false)}
+                        className="px-4 py-2 bg-transparent text-white border-2 border-gray-700 font-black text-xs hover:border-white"
+                      >
+                        CANCEL
+                      </button>
+                    </div>
+                  ) : (
+                    <div className="text-gray-500 text-xs">Response sent.</div>
+                  )}
+                </div>
+              </div>
+            )
+          }
+
+          return (
+            <div
+              key={message.id}
+              className={`flex ${message.role === 'user' ? 'justify-end' : 'justify-start'}`}
+            >
+              <div
+                className={`max-w-2xl ${
+                  message.role === 'user'
+                    ? 'bg-white text-black border-2 border-white'
+                    : 'bg-transparent text-white border-2 border-gray-700'
+                } p-4 font-mono text-sm leading-relaxed break-words`}
+              >
+                <div className="font-black text-xs tracking-wider mb-2 opacity-70">
+                  {message.role === 'user' ? 'YOU' : 'AGENT'}
+                </div>
+                <div className="whitespace-pre-wrap">{message.content}</div>
+              </div>
+            </div>
+          )
+        })}
+      </div>
+    </div>
+  )
+}
+</file>
+
+<file path="ai-service/app/repositories/order_repository.py">
+import uuid
+from datetime import date, timedelta
+from sqlalchemy.orm import Session
+from app.models.order import Order
+from typing import Optional
+from pydantic import BaseModel
+
+
+class OrderDTO(BaseModel):
+    id: str
+    status_code: str
+    delivery_date: str
+    product_id: Optional[str] = None
+    quantity: Optional[int] = None
+    total_price: Optional[float] = None
+
+
+class OrderRepository:
+    def __init__(self, db_session: Session):
+        self.db = db_session
+
+    def get_order_by_id(self, order_id: str) -> Optional[OrderDTO]:
+        order_record = self.db.query(Order).filter(Order.id == order_id).first()
+
+        if not order_record:
+            return None
+
+        return OrderDTO(
+            id=order_record.id,
+            status_code=order_record.status_code,
+            delivery_date=str(order_record.delivery_date),
+            product_id=order_record.product_id,
+            quantity=order_record.quantity,
+            total_price=order_record.total_price,
+        )
+
+    def create_order(self, product_id: str, quantity: int, total_price: float) -> OrderDTO:
+        """Stages a new order in the current session. Deliberately does NOT
+        commit -- the service layer commits once, together with the stock
+        decrement, so both succeed or both roll back as a single unit."""
+        order_id = f"ORD-{str(uuid.uuid4())[:8].upper()}"
+        new_order = Order(
+            id=order_id,
+            status_code="Processing",
+            delivery_date=date.today() + timedelta(days=5),
+            product_id=product_id,
+            quantity=quantity,
+            total_price=total_price,
+        )
+        self.db.add(new_order)
+        self.db.flush()  # assigns/validates without committing yet
+
+        return OrderDTO(
+            id=new_order.id,
+            status_code=new_order.status_code,
+            delivery_date=str(new_order.delivery_date),
+            product_id=new_order.product_id,
+            quantity=new_order.quantity,
+            total_price=new_order.total_price,
+        )
+</file>
+
+<file path="ai-service/app/services/order_service.py">
+from app.repositories.order_repository import OrderRepository
+from app.repositories.product_repository import ProductRepository
+from app.database import get_db
+
+
+class OrderService:
+
+    @staticmethod
+    def lookup(order_id: str):
+        db_session = next(get_db())
+        try:
+            repo = OrderRepository(db_session)
+            order_data = repo.get_order_by_id(order_id)
+
+            if not order_data:
+                return {"error": f"Order with ID :{order_id} not found"}
+
+            return order_data.model_dump()
+        finally:
+            db_session.close()
+
+    @staticmethod
+    def place_order(product_id: str, quantity: int):
+        """Creates an order and decrements product stock as a single
+        atomic transaction. This should only ever be called AFTER a human
+        has confirmed the order via the HITL interrupt in the place_order
+        tool -- this method itself does not gate on confirmation, it just
+        performs the (already-approved) write."""
+        db_session = next(get_db())
+        try:
+            product_repo = ProductRepository(db_session)
+            order_repo = OrderRepository(db_session)
+
+            product = product_repo.get_product_by_id(product_id)
+            if not product:
+                return {"error": f"Product with ID {product_id} not found."}
+
+            if product.stock_left < quantity:
+                return {
+                    "error": f"Insufficient stock for {product.name}. "
+                             f"Only {product.stock_left} left."
+                }
+
+            total_price = round(product.price * quantity, 2)
+
+            order = order_repo.create_order(
+                product_id=product_id,
+                quantity=quantity,
+                total_price=total_price,
+            )
+            product_repo.decrement_stock(product_id, quantity)
+
+            # Single commit: order creation and stock decrement succeed or
+            # fail together.
+            db_session.commit()
+
+            return order.model_dump()
+        except Exception:
+            db_session.rollback()
+            raise
+        finally:
+            db_session.close()
+</file>
+
+<file path="ai-service/app/tools/order.py">
+import json
+from langchain_core.tools import tool
+from langgraph.types import interrupt
+from app.services.order_service import OrderService
+from app.services.product_service import ProductService
+
+
+@tool
+def order_lookup(order_id: str) -> str:
+    """
+    Look up an order by its ID.
+    """
+    order = OrderService.lookup(order_id)
+    if not order:
+        return json.dumps({"error": f"Order with ID :{order_id} not found"})
+
+    return json.dumps(order)
+
+
+@tool
+def place_order(product_id: str, quantity: int) -> str:
+    """
+    Place an order for a specific product and quantity.
+
+    ALWAYS call product_lookup first to get the exact product_id and confirm
+    the item is in stock -- do not guess a product_id. Only call this tool
+    once the user has clearly said they want to buy/order the item (not
+    just asked about its price or availability).
+
+    This tool pauses and requires the user to explicitly confirm the order
+    (product, quantity, total price) before anything is written to the
+    database. Do not ask the user for confirmation yourself in your own
+    reply -- the tool's confirmation step handles that; just call the tool
+    once you have a product_id and quantity.
+    """
+    # Re-fetch fresh product info by ID (price/stock may have changed since
+    # any earlier product_lookup call, and the LLM may only have a name).
+    product = ProductService.get_by_id(product_id)
+    if "error" in product:
+        return json.dumps(product)
+
+    if product["stock_left"] < quantity:
+        return json.dumps({
+            "error": f"Only {product['stock_left']} unit(s) of "
+                     f"{product['name']} left in stock."
+        })
+
+    total_price = round(product["price"] * quantity, 2)
+
+    # Pauses graph execution here. Whatever object is passed in becomes the
+    # payload the client (chat.py) forwards to the frontend as a
+    # "confirmation_required" event. Whatever the human resumes with
+    # (via Command(resume=...)) becomes this call's return value below.
+    #
+    # IMPORTANT: everything in this function ABOVE this line re-runs from
+    # the top when the graph resumes (that's how interrupt() works -- the
+    # whole node/tool call is re-executed). Everything above is read-only,
+    # so that's safe. The actual write (OrderService.place_order) only
+    # happens below, AFTER a confirmed resume -- never before.
+    decision = interrupt({
+        "type": "order_confirmation",
+        "product_id": product_id,
+        "product_name": product["name"],
+        "quantity": quantity,
+        "unit_price": product["price"],
+        "total_price": total_price,
+    })
+
+    if not isinstance(decision, dict) or not decision.get("confirmed"):
+        return json.dumps({"status": "cancelled", "message": "Order was not placed."})
+
+    result = OrderService.place_order(product_id=product_id, quantity=quantity)
+    return json.dumps(result)
+</file>
+
 <file path="ai-service/app/api/chat.py">
 import json
 import uuid
@@ -2802,13 +3434,25 @@ from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from langchain_core.messages import HumanMessage, AIMessageChunk
+from langgraph.types import Command
 
 router = APIRouter()
 
+SSE_HEADERS = {
+    "Cache-Control": "no-cache",
+    "Connection": "keep-alive",
+    "X-Accel-Buffering": "no",
+}
+
 
 class ChatRequest(BaseModel):
-    message: str = Field(min_length=1, max_length=4000) 
+    message: str = Field(min_length=1, max_length=4000)
     thread_id: str = Field(default_factory=lambda: str(uuid.uuid4()), max_length=200)
+
+
+class ResumeRequest(BaseModel):
+    thread_id: str = Field(min_length=1, max_length=200)
+    confirmed: bool
 
 
 def _extract_text(content) -> str:
@@ -2824,52 +3468,80 @@ def _extract_text(content) -> str:
     return ""
 
 
+async def _stream_agent(agent, graph_input, config):
+    """Shared streaming logic used by both a fresh turn (/chat) and a
+    resumed post-interrupt turn (/chat/resume).
+
+    Uses two stream modes simultaneously:
+      - "messages": token-by-token AIMessageChunk streaming (same behavior
+        as before -- one tuple (msg, metadata) per chunk).
+      - "updates": lets us detect when the graph has paused on an
+        interrupt() call. When that happens, LangGraph's update dict
+        contains a "__interrupt__" key holding the Interrupt object(s);
+        `.value` is exactly what was passed to interrupt() in the tool
+        (see app/tools/order.py). We forward that straight to the client
+        instead of the stream just silently going quiet.
+    """
+    try:
+        async for stream_mode, data in agent.astream(
+            graph_input, config=config, stream_mode=["messages", "updates"]
+        ):
+            if stream_mode == "messages":
+                msg, _metadata = data
+                if not isinstance(msg, AIMessageChunk) or not msg.content:
+                    continue
+                text = _extract_text(msg.content)
+                if text:
+                    yield f"data: {json.dumps({'chunk': text})}\n\n"
+
+            elif stream_mode == "updates":
+                if isinstance(data, dict) and "__interrupt__" in data:
+                    interrupt_obj = data["__interrupt__"][0]
+                    yield f"data: {json.dumps({'type': 'confirmation_required', 'payload': interrupt_obj.value})}\n\n"
+    except Exception as e:
+        yield f"data: {json.dumps({'error': str(e)})}\n\n"
+    finally:
+        yield "data: [DONE]\n\n"
+
+
 @router.post("/chat")
 async def chat_endpoint(request: ChatRequest, http_request: Request):
-    user_input = request.message
     thread_id = request.thread_id
-
-    initial_state = {'messages': [HumanMessage(content=user_input)]}
+    initial_state = {"messages": [HumanMessage(content=request.message)]}
     config = {"configurable": {"thread_id": thread_id}}
-    
     agent = http_request.app.state.agent
 
     async def response_generator():
         yield f"data: {json.dumps({'thread_id': thread_id})}\n\n"
-
-        try:
-            async for msg, metadata in agent.astream(
-                initial_state, config=config, stream_mode="messages"
-            ):
-                if not isinstance(msg, AIMessageChunk) or not msg.content:
-                    continue
-
-                text = _extract_text(msg.content)
-                if text:
-                    yield f"data: {json.dumps({'chunk': text})}\n\n"
-        except Exception as e:
-            yield f"data: {json.dumps({'error': str(e)})}\n\n"
-        finally:
-            yield "data: [DONE]\n\n"
+        async for event in _stream_agent(agent, initial_state, config):
+            yield event
 
     return StreamingResponse(
         response_generator(),
         media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
+        headers=SSE_HEADERS,
     )
-</file>
 
-<file path="ai-service/app/tools/tool_collection.py">
-from app.tools.order import order_lookup
-from app.tools.product import product_lookup
-from app.tools.ticket import create_support_ticket
-from app.tools.policy import policy_lookup
 
-tools=[order_lookup, product_lookup, create_support_ticket, policy_lookup]
+@router.post("/chat/resume")
+async def resume_endpoint(request: ResumeRequest, http_request: Request):
+    """Resumes a conversation that's paused on a pending confirmation
+    (e.g. place_order's HITL interrupt). `confirmed` is whatever the user
+    clicked in the frontend's confirmation card."""
+    config = {"configurable": {"thread_id": request.thread_id}}
+    agent = http_request.app.state.agent
+
+    async def response_generator():
+        async for event in _stream_agent(
+            agent, Command(resume={"confirmed": request.confirmed}), config
+        ):
+            yield event
+
+    return StreamingResponse(
+        response_generator(),
+        media_type="text/event-stream",
+        headers=SSE_HEADERS,
+    )
 </file>
 
 <file path="ai-service/app/graph/builder.py">
@@ -2890,6 +3562,16 @@ graph.add_conditional_edges('chatbot_node', tools_condition)
 graph.add_edge('tools', 'chatbot_node')
 </file>
 
+<file path="ai-service/app/tools/tool_collection.py">
+from app.tools.order import order_lookup, place_order
+from app.tools.product import product_lookup
+from app.tools.ticket import create_support_ticket
+from app.tools.policy import policy_lookup
+
+
+tools=[order_lookup, place_order, product_lookup, create_support_ticket, policy_lookup]
+</file>
+
 <file path="ai-service/app/graph/nodes.py">
 from langchain_core.runnables import RunnableConfig
 from app.graph.state import AgentState
@@ -2908,29 +3590,6 @@ async def chatbot_node(state: AgentState, config: RunnableConfig) -> AgentState:
         full_response = chunk if full_response is None else full_response + chunk
 
     return {'messages': [full_response]}
-</file>
-
-<file path="ai-service/app/services/gemini.py">
-import os
-from dotenv import load_dotenv
-from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
-
-load_dotenv()
-
-api_key = os.getenv("GOOGLE_API_KEY")
-
-if not api_key:
-    raise ValueError("GOOGLE_API_KEY is not set in the environment variables.")
-
-base_llm = ChatGoogleGenerativeAI(model="gemini-3.1-flash-lite", api_key=api_key, timeout=30, max_retries=3)
-base_embeddings = GoogleGenerativeAIEmbeddings(model="gemini-embedding-001", api_key=api_key, output_dimensionality=768)
-
-def get_llm():
-    from app.tools.tool_collection import tools
-    return base_llm.bind_tools(tools)
-
-def get_embeddings():
-    return base_embeddings
 </file>
 
 <file path="ai-service/app/main.py">
@@ -3060,6 +3719,29 @@ langchain-pinecone
 langgraph-checkpoint-postgres 
 psycopg 
 psycopg-pool
+</file>
+
+<file path="ai-service/app/services/gemini.py">
+import os
+from dotenv import load_dotenv
+from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
+
+load_dotenv()
+
+api_key = os.getenv("GOOGLE_API_KEY")
+
+if not api_key:
+    raise ValueError("GOOGLE_API_KEY is not set in the environment variables.")
+
+base_llm = ChatGoogleGenerativeAI(model="gemini-3.1-flash-lite", api_key=api_key, timeout=30, max_retries=2)
+base_embeddings = GoogleGenerativeAIEmbeddings(model="gemini-embedding-001", api_key=api_key, output_dimensionality=768)
+
+def get_llm():
+    from app.tools.tool_collection import tools
+    return base_llm.bind_tools(tools)
+
+def get_embeddings():
+    return base_embeddings
 </file>
 
 <file path="ai-service/repomix-output.xml">
